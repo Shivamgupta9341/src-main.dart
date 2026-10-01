@@ -21,7 +21,7 @@ jobs:
           flutter create --project-name ludo_nearby --org com.example --platforms android app
           cp src/main.dart app/lib/main.dart
           cd app
-          flutter pub add nearby_connections permission_handler audioplayers
+          flutter pub add nearby_connections "permission_handler:^11.3.1" audioplayers
           python3 - <<'PY'
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p).read()
