@@ -166,6 +166,7 @@ class Game {
   List<List<int>> cards = List.generate(4, (_) => <int>[]);
   List<bool> shield = List.filled(4, false);
   List<bool> skip = List.filled(4, false);
+  bool team = false; // 2 vs 2: Red+Yellow against Green+Blue
   int turn = 0, dice = 0, lastRoll = 0, lastRoller = -1;
   int rollSeq = 0, sixes = 0, winner = -1;
   bool started = false;
@@ -181,6 +182,7 @@ class Game {
         'cards': cards,
         'shield': shield,
         'skip': skip,
+        'team': team,
         'turn': turn,
         'dice': dice,
         'lastRoll': lastRoll,
@@ -204,6 +206,7 @@ class Game {
         .toList();
     shield = (j['shield'] as List).map((e) => e as bool).toList();
     skip = (j['skip'] as List).map((e) => e as bool).toList();
+    team = j['team'] as bool;
     turn = j['turn'] as int;
     dice = j['dice'] as int;
     lastRoll = j['lastRoll'] as int;
@@ -215,9 +218,18 @@ class Game {
     msg = j['msg'] as String;
   }
 
+  int partner(int c) => (c + 2) % 4;
+
+  // Whose tokens does player c move? In team mode, a player whose own
+  // tokens are all home moves their partner's tokens.
+  int ctl(int c) =>
+      (team && pos[c].every((e) => e == 56) && active[partner(c)])
+          ? partner(c)
+          : c;
+
   bool canMove(int c, int i) {
     if (dice == 0) return false;
-    final p = pos[c][i];
+    final p = pos[ctl(c)][i];
     if (p == -1) return dice == 6;
     return p + dice <= 56;
   }
@@ -322,15 +334,17 @@ class Game {
 
   void move(int c, int i) {
     if (!started || winner >= 0 || c != turn || !canMove(c, i)) return;
-    final p = pos[c][i];
+    final k = ctl(c);
+    final p = pos[k][i];
     final np = p == -1 ? 0 : p + dice;
-    pos[c][i] = np;
+    pos[k][i] = np;
     var cap = false, blocked = false;
     if (np <= 50) {
-      final a = (kStart[c] + np) % 52;
+      final a = (kStart[k] + np) % 52;
       if (!kSafe.contains(a)) {
         for (var o = 0; o < 4; o++) {
-          if (o == c || !active[o]) continue;
+          if (o == k || !active[o]) continue;
+          if (team && o % 2 == k % 2) continue;
           for (var j = 0; j < 4; j++) {
             final q = pos[o][j];
             if (q >= 0 && q <= 50 && (kStart[o] + q) % 52 == a) {
@@ -347,11 +361,22 @@ class Game {
     }
     var gotCard = false;
     if (cap || np == 56) gotCard = giveCard(c);
-    if (pos[c].every((e) => e == 56)) {
+    if (team) {
+      final mem = [
+        for (var x = 0; x < 4; x++)
+          if (active[x] && x % 2 == c % 2) x
+      ];
+      if (mem.every((x) => pos[x].every((e) => e == 56))) {
+        winner = c;
+        dice = 0;
+        msg = '${mem.map(n).join(' & ')} win! 🎉';
+        return;
+      }
+    } else if (pos[c].every((e) => e == 56)) {
       rank.add(c);
       final left = [
-        for (var k = 0; k < 4; k++)
-          if (active[k] && !rank.contains(k)) k
+        for (var x = 0; x < 4; x++)
+          if (active[x] && !rank.contains(x)) x
       ];
       if (left.length <= 1) {
         if (left.length == 1) rank.add(left.first);
@@ -371,6 +396,53 @@ class Game {
       msg += ' - roll again';
     } else {
       pass();
+    }
+  }
+
+  // Start a fresh game with the same players
+  void reset() {
+    pos = List.generate(4, (_) => List.filled(4, -1));
+    rank = [];
+    winner = -1;
+    dice = 0;
+    lastRoll = 0;
+    lastRoller = -1;
+    sixes = 0;
+    started = true;
+    turn = max<int>(0, active.indexOf(true));
+    dealCards();
+    msg = 'New game - ${n(turn)} starts';
+  }
+
+  // A player leaves (or is removed) - the others carry on
+  void removePlayer(int c) {
+    if (!active[c]) return;
+    final nm = names[c];
+    active[c] = false;
+    pos[c] = [-1, -1, -1, -1];
+    cards[c] = [];
+    shield[c] = false;
+    skip[c] = false;
+    names[c] = kNames[c];
+    team = false;
+    if (started && winner < 0) {
+      final left = [
+        for (var k = 0; k < 4; k++)
+          if (active[k] && !rank.contains(k)) k
+      ];
+      if (left.length <= 1) {
+        if (left.length == 1) rank.add(left.first);
+        winner = rank.isNotEmpty ? rank.first : 0;
+        dice = 0;
+        msg = '${n(winner)} wins - the others left';
+      } else if (turn == c) {
+        msg = '$nm left the game';
+        pass();
+      } else {
+        msg = '$nm left the game';
+      }
+    } else if (!started) {
+      msg = '$nm left';
     }
   }
 }
@@ -458,6 +530,11 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   final Map<String, String> found = {};
   final Map<String, String> _pending = {};
   final Map<int, String> emo = {};
+  bool isLocal = false, localSetup = false, teamMode = false;
+  int localCount = 4;
+  final List<TextEditingController> _lnames =
+      List.generate(4, (_) => TextEditingController());
+  int get _self => isLocal ? g.turn : myColor;
 
   List<List<int>>? _from; // token positions before the current move animation
   bool _rolling = false, _winPlayed = false;
@@ -467,6 +544,9 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    for (var c = 0; c < 4; c++) {
+      _lnames[c].text = 'Player ${c + 1}';
+    }
     _moveCtl.addStatusListener((s) {
       if (s == AnimationStatus.completed && mounted) {
         setState(() => _from = null);
@@ -481,6 +561,9 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     _moveCtl.dispose();
     _rollCtl.dispose();
     _name.dispose();
+    for (final t in _lnames) {
+      t.dispose();
+    }
     super.dispose();
   }
 
@@ -576,6 +659,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     final tot = g.cards.fold<int>(0, (a, l) => a + l.length);
     if (tot > _lastCards) sfx.play('card');
     _lastCards = tot;
+    if (g.winner < 0) _winPlayed = false;
     if (g.winner >= 0 && !_winPlayed) {
       _winPlayed = true;
       Future.delayed(const Duration(milliseconds: 600), () => sfx.play('win'));
@@ -598,7 +682,8 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     final c = g.turn;
     final mv = g.movable(c);
     if (mv.isEmpty) return;
-    final uniq = mv.map((i) => g.pos[c][i]).toSet();
+    final k = g.ctl(c);
+    final uniq = mv.map((i) => g.pos[k][i]).toSet();
     if (uniq.length != 1) return;
     final seq = g.rollSeq;
     Future.delayed(const Duration(milliseconds: 1100), () {
@@ -666,30 +751,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     }
     final c = clients.remove(id);
     if (c == null) return;
-    _hostAct(() {
-      g.active[c] = false;
-      g.pos[c] = [-1, -1, -1, -1];
-      g.cards[c] = [];
-      g.shield[c] = false;
-      g.skip[c] = false;
-      g.names[c] = kNames[c];
-      if (g.started && g.winner < 0) {
-        final left = [
-          for (var k = 0; k < 4; k++)
-            if (g.active[k] && !g.rank.contains(k)) k
-        ];
-        if (left.length <= 1) {
-          if (left.length == 1) g.rank.add(left.first);
-          g.winner = g.rank.isNotEmpty ? g.rank.first : 0;
-          g.dice = 0;
-          g.msg = '${g.n(g.winner)} wins - the others left';
-        } else if (g.turn == c) {
-          g.pass();
-        }
-      } else if (!g.started) {
-        g.msg = '${kNames[c]} left';
-      }
-    });
+    _hostAct(() => g.removePlayer(c));
   }
 
   void _start() {
@@ -697,6 +759,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     _winPlayed = false;
     _hostAct(() {
       g.started = true;
+      if (g.active.where((a) => a).length < 4) g.team = false;
       g.dealCards();
       g.turn = 0;
       g.dice = 0;
@@ -792,7 +855,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
 
   void _rollTap() {
     if (isHost) {
-      _hostAct(() => g.roll(0));
+      _hostAct(() => g.roll(_self));
     } else {
       _sendHost({'t': 'roll'});
     }
@@ -800,7 +863,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
 
   void _moveTap(int i) {
     if (isHost) {
-      _hostAct(() => g.move(0, i));
+      _hostAct(() => g.move(_self, i));
     } else {
       _sendHost({'t': 'move', 'i': i});
     }
@@ -808,7 +871,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
 
   void _useCard(int k) {
     String? why;
-    if (g.turn != myColor || g.winner >= 0) {
+    if (g.turn != _self || g.winner >= 0) {
       why = "It's not your turn";
     } else if (k == 0 && g.dice == 0) {
       why = 'Roll the dice first, then use Reroll';
@@ -823,14 +886,14 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
       return;
     }
     if (isHost) {
-      _hostAct(() => g.useCard(0, k));
+      _hostAct(() => g.useCard(_self, k));
     } else {
       _sendHost({'t': 'card', 'k': k});
     }
   }
 
   Widget _cardTray() {
-    final mine = g.cards[myColor];
+    final mine = g.cards[_self];
     return SizedBox(
       height: 44,
       child: Row(
@@ -857,14 +920,15 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   }
 
   void _boardTap(Offset o, double s) {
-    if (g.turn != myColor || g.dice == 0 || g.winner >= 0 || _from != null) {
+    if (g.turn != _self || g.dice == 0 || g.winner >= 0 || _from != null) {
       return;
     }
+    final k = g.ctl(_self);
     int? best;
     var bestD = 0.75 * s;
-    for (final i in g.movable(myColor)) {
-      final pt = tokenAt(myColor, i, g.pos[myColor][i].toDouble(),
-              off: stackOff(g, myColor, i)) *
+    for (final i in g.movable(_self)) {
+      final pt = tokenAt(k, i, g.pos[k][i].toDouble(),
+              off: stackOff(g, k, i)) *
           s;
       final d = (pt - o).distance;
       if (d < bestD) {
@@ -876,9 +940,11 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   }
 
   void _leave() {
-    Nearby().stopAdvertising();
-    Nearby().stopDiscovery();
-    Nearby().stopAllEndpoints();
+    if (!isLocal) {
+      Nearby().stopAdvertising();
+      Nearby().stopDiscovery();
+      Nearby().stopAllEndpoints();
+    }
     _flick?.cancel();
     setState(() {
       inRoom = false;
@@ -896,6 +962,8 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
       _seenRoll = 0;
       _lastCards = 0;
       _winPlayed = false;
+      isLocal = false;
+      localSetup = false;
       status = '';
     });
   }
@@ -905,7 +973,9 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   Widget build(BuildContext context) {
     Widget body;
     var inGame = false;
-    if (!inRoom && !discovering) {
+    if (!inRoom && !discovering && localSetup) {
+      body = _localSetup();
+    } else if (!inRoom && !discovering) {
       body = _menu();
     } else if (discovering && !inRoom) {
       body = _finder();
@@ -922,6 +992,11 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
           : AppBar(
               backgroundColor: Colors.transparent,
               elevation: 0,
+              leading: (localSetup && !inRoom)
+                  ? IconButton(
+                      icon: const Icon(Icons.arrow_back),
+                      onPressed: () => setState(() => localSetup = false))
+                  : null,
               title: const Text('Ludo Friends'),
               actions: [
                 if (inRoom || discovering)
@@ -947,6 +1022,135 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     );
   }
 
+  List<int> _cols() =>
+      localCount == 2 ? [0, 2] : (localCount == 3 ? [0, 1, 2] : [0, 1, 2, 3]);
+
+  void _startLocal() {
+    g = Game();
+    isLocal = true;
+    isHost = true;
+    myColor = 0;
+    final cols = _cols();
+    for (var c = 0; c < 4; c++) {
+      g.active[c] = cols.contains(c);
+      final t = _lnames[c].text.trim();
+      g.names[c] = t.isEmpty ? kNames[c] : t;
+    }
+    g.team = localCount == 4 && teamMode;
+    _seenRoll = 0;
+    _lastCards = 0;
+    _winPlayed = false;
+    setState(() => inRoom = true);
+    _hostAct(() {
+      g.started = true;
+      g.dealCards();
+      g.turn = 0;
+      g.msg = '${g.n(0)} starts - roll the dice';
+    });
+  }
+
+  Future<void> _confirmExit() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Leave the game?'),
+        content: Text(isLocal
+            ? 'This ends the game for everyone.'
+            : (isHost
+                ? 'You are the host - the game will end for everyone.'
+                : 'The other players will carry on without you.')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Stay')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Leave')),
+        ],
+      ),
+    );
+    if (ok == true) _leave();
+  }
+
+  Future<void> _removeDialog() async {
+    final c = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Who is leaving?'),
+        children: [
+          for (var k = 0; k < 4; k++)
+            if (g.active[k])
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, k),
+                child: Row(
+                  children: [
+                    CircleAvatar(radius: 8, backgroundColor: kColors[k]),
+                    const SizedBox(width: 10),
+                    Text(g.names[k]),
+                  ],
+                ),
+              ),
+        ],
+      ),
+    );
+    if (c != null) _hostAct(() => g.removePlayer(c));
+  }
+
+  Widget _localSetup() => Padding(
+        padding: const EdgeInsets.all(20),
+        child: ListView(
+          children: [
+            Text('Play on this phone',
+                style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 4),
+            const Text('Everyone sits together and passes the phone around. No internet or Bluetooth needed.',
+                style: TextStyle(color: Colors.white70)),
+            const SizedBox(height: 16),
+            const Text('How many players?'),
+            const SizedBox(height: 8),
+            SegmentedButton<int>(
+              segments: const [
+                ButtonSegment<int>(value: 2, label: Text('2 players')),
+                ButtonSegment<int>(value: 3, label: Text('3 players')),
+                ButtonSegment<int>(value: 4, label: Text('4 players')),
+              ],
+              selected: {localCount},
+              onSelectionChanged: (v) => setState(() {
+                localCount = v.first;
+                if (localCount < 4) teamMode = false;
+              }),
+            ),
+            if (localCount == 4)
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('2 vs 2 teams'),
+                subtitle: const Text(
+                    'Red + Yellow vs Green + Blue. Partners never capture each other, and a team wins when all 8 tokens are home.'),
+                value: teamMode,
+                onChanged: (v) => setState(() => teamMode = v),
+              ),
+            const SizedBox(height: 12),
+            for (final c in _cols())
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: TextField(
+                  controller: _lnames[c],
+                  decoration: InputDecoration(
+                    labelText: '${kNames[c]} player name',
+                    border: const OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.circle, color: kColors[c]),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 8),
+            FilledButton.icon(
+                onPressed: _startLocal,
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('Start game')),
+          ],
+        ),
+      );
+
   Widget _menu() => Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -969,9 +1173,14 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
             ),
             const SizedBox(height: 20),
             FilledButton.icon(
+                onPressed: () => setState(() => localSetup = true),
+                icon: const Icon(Icons.groups),
+                label: const Text('Play on this phone (offline)')),
+            const SizedBox(height: 12),
+            FilledButton.tonalIcon(
                 onPressed: _host,
                 icon: const Icon(Icons.wifi_tethering),
-                label: const Text('Host game')),
+                label: const Text('Host game (WiFi / Bluetooth)')),
             const SizedBox(height: 12),
             OutlinedButton.icon(
                 onPressed: _discover,
@@ -1044,6 +1253,14 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
                     g.active[c] ? Icons.check_circle : Icons.hourglass_empty),
               ),
             ),
+          if (isHost && n == 4)
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('2 vs 2 teams'),
+              subtitle: const Text('Red + Yellow vs Green + Blue'),
+              value: g.team,
+              onChanged: (v) => _hostAct(() => g.team = v),
+            ),
           const SizedBox(height: 8),
           const Text(
             'Power cards (everyone can see them):\n'
@@ -1064,8 +1281,10 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
   }
 
   Widget _gameView() {
-    final pickable =
-        g.turn == myColor && g.dice > 0 && g.winner < 0 && !g.rank.contains(myColor);
+    final pickable = g.turn == _self &&
+        g.dice > 0 &&
+        g.winner < 0 &&
+        !g.rank.contains(_self);
     return Stack(
       children: [
         Column(
@@ -1104,7 +1323,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
                               size: Size(box.maxWidth, box.maxWidth),
                               painter: BoardPainter(
                                 g: g,
-                                me: myColor,
+                                me: _self,
                                 pickable: pickable,
                                 from: _from,
                                 moveCtl: _moveCtl,
@@ -1127,7 +1346,8 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
               ),
             ),
             _cardTray(),
-            Row(
+            if (!isLocal)
+              Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 for (final e in kEmojis)
@@ -1147,7 +1367,24 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
         padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
         child: Row(
           children: [
-            IconButton(icon: const Icon(Icons.exit_to_app), onPressed: _leave),
+            isLocal
+                ? PopupMenuButton<String>(
+                    icon: const Icon(Icons.menu),
+                    onSelected: (v) {
+                      if (v == 'rm') {
+                        _removeDialog();
+                      } else {
+                        _confirmExit();
+                      }
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'rm', child: Text('A player is leaving')),
+                      PopupMenuItem(value: 'exit', child: Text('End game & exit')),
+                    ],
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.exit_to_app),
+                    onPressed: _confirmExit),
             Expanded(
               child: Text(g.msg,
                   textAlign: TextAlign.center,
@@ -1168,7 +1405,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
     final col = kColors[c];
     final fin = g.rank.contains(c);
     final turnNow = g.turn == c && g.winner < 0 && !fin;
-    final mine = c == myColor;
+    final mine = c == _self;
     final canRoll = turnNow && mine && g.dice == 0 && !_rolling;
     var shown = 0;
     var spin = false;
@@ -1208,7 +1445,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
                   ],
                 ),
                 const SizedBox(height: 3),
-                Text(g.names[c] + (mine ? ' (you)' : ''),
+                Text(g.names[c] + (mine && !isLocal ? ' (you)' : ''),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -1218,6 +1455,7 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
                     if (fin) '🏅 #${g.rank.indexOf(c) + 1}',
                     if (g.shield[c]) '🛡️ Shield',
                     if (g.skip[c]) '🧊 Frozen',
+                    if (g.team) 'Team ${c % 2 == 0 ? 'A' : 'B'}',
                   ].join(' '),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -1276,6 +1514,10 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
 
   Widget _result() {
     const medals = ['🥇', '🥈', '🥉', '4️⃣'];
+    final winners = [
+      for (var x = 0; x < 4; x++)
+        if (g.active[x] && g.winner >= 0 && x % 2 == g.winner % 2) g.names[x]
+    ].join(' & ');
     return Positioned.fill(
       child: Container(
         color: Colors.black54,
@@ -1291,15 +1533,29 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
                       style:
                           TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
                   const SizedBox(height: 12),
-                  for (var k = 0; k < g.rank.length; k++)
-                    ListTile(
-                      leading: Text(medals[k], style: const TextStyle(fontSize: 28)),
-                      title: Text(g.names[g.rank[k]]),
-                      trailing: CircleAvatar(
-                          radius: 9, backgroundColor: kColors[g.rank[k]]),
-                    ),
+                  if (g.team)
+                    Text('$winners win!',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold))
+                  else
+                    for (var k = 0; k < g.rank.length; k++)
+                      ListTile(
+                        leading: Text(medals[k],
+                            style: const TextStyle(fontSize: 28)),
+                        title: Text(g.names[g.rank[k]]),
+                        trailing: CircleAvatar(
+                            radius: 9, backgroundColor: kColors[g.rank[k]]),
+                      ),
                   const SizedBox(height: 12),
-                  FilledButton(onPressed: _leave, child: const Text('Exit')),
+                  if (isHost)
+                    FilledButton(
+                        onPressed: () => _hostAct(g.reset),
+                        child: const Text('Play again'))
+                  else
+                    const Text('Waiting for the host to start a new game...',
+                        style: TextStyle(fontSize: 12)),
+                  TextButton(onPressed: _leave, child: const Text('Exit')),
                 ],
               ),
             ),
@@ -1584,7 +1840,7 @@ class BoardPainter extends CustomPainter {
           lift = sin(pi * (d - d.floor())) * .35;
         }
         final sh = g.shield[c] && g.pos[c][i] >= 0 && g.pos[c][i] <= 50;
-        items.add(_Tok(c, p * s, lift, c == me && mov.contains(i), sh));
+        items.add(_Tok(c, p * s, lift, c == g.ctl(me) && mov.contains(i), sh));
       }
     }
     items.sort((a, b) => a.p.dy.compareTo(b.p.dy));
