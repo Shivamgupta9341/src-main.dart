@@ -509,7 +509,10 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
       Permission.bluetoothScan,
       Permission.nearbyWifiDevices,
     ].request();
-    await Nearby().enableLocationServices();
+    final gpsOn = await Permission.location.serviceStatus.isEnabled;
+    if (!gpsOn && mounted) {
+      setState(() => status = 'Please turn on Location (GPS) in your phone settings');
+    }
   }
 
   // ───────── animations / sounds ─────────
@@ -524,12 +527,12 @@ class _LudoHomeState extends State<LudoHome> with TickerProviderStateMixin {
           cap = true;
           continue;
         }
-        steps = max(steps, b - a);
+        steps = max<int>(steps, b - a);
       }
     }
     if (steps == 0 && !cap) return;
     _from = before;
-    final ms = 170 * max(steps, 1) + 150;
+    final int ms = 170 * max<int>(steps, 1) + 150;
     _moveCtl.duration = Duration(milliseconds: ms);
     _moveCtl.forward(from: 0);
     for (var s = 0; s < min(steps, 6); s++) {
